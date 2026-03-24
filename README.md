@@ -1,2 +1,2 @@
-# categorization-helper
+# data-categorization-agent
 categorization helper
