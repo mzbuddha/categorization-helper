@@ -164,6 +164,52 @@ def parse_spss_syntax(syntax_text):
             
     return rules
 
+def parse_column_guide_labels(xl_file):
+    try:
+        if '컬럼가이드' not in xl_file.sheet_names:
+            return {}
+        df_guide = pd.read_excel(xl_file, sheet_name='컬럼가이드', header=None)
+    except Exception:
+        return {}
+        
+    start_row = -1
+    start_col = -1
+    for r in range(df_guide.shape[0]):
+        for c in range(df_guide.shape[1]):
+            val = str(df_guide.iloc[r, c]).strip()
+            if 'VALUE LABELS' in val.upper():
+                start_row = r
+                start_col = c
+                break
+        if start_row != -1:
+            break
+            
+    if start_row == -1:
+        return {}
+        
+    labels_dict = {}
+    current_vars = []
+    
+    for r in range(start_row + 1, df_guide.shape[0]):
+        val = str(df_guide.iloc[r, start_col]).strip().replace("''", "'")
+        if not val or val.lower() == 'nan':
+            continue
+            
+        if val.startswith('/'):
+            vars_part = val[1:].strip().split()
+            current_vars = vars_part
+            for v in current_vars:
+                if v not in labels_dict:
+                    labels_dict[v] = {}
+        elif current_vars:
+            m = re.match(r"^(\d+)\s+['\"](.*?)['\"]", val)
+            if m:
+                code = int(m.group(1))
+                label_str = m.group(2).strip()
+                for v in current_vars:
+                    labels_dict[v][code] = label_str
+
+    return labels_dict
 
 # ==========================================
 # 1. Helper Functions (Logic)
@@ -260,7 +306,7 @@ def snap_edges(edges, step):
     return sorted(set(snapped))
 
 
-def suggest_bins(series, continuous, k=3, label=None, var_type_val=None):
+def suggest_bins(series, continuous, k=3, label=None, var_type_val=None, predefined_labels=None):
     valid_data = pd.to_numeric(series.dropna(), errors="coerce").dropna()
     if valid_data.empty:
         return None
@@ -273,20 +319,29 @@ def suggest_bins(series, continuous, k=3, label=None, var_type_val=None):
         k = min(k, 4)
 
     is_likert = False
+    likert_max = 0
     if isinstance(var_type_val, str) and "리커트" in var_type_val:
         is_likert = True
+        # Extract scale point (e.g. "4점 리커트" -> 4)
+        m = re.search(r'(\d+)점', var_type_val)
+        if m:
+            likert_max = int(m.group(1))
 
     # -----------------------------------
     # 0. 저빈도(Low Cardinality) 분할 - 소수점 생성을 방지하기 위한 특별 예외처리
     # -----------------------------------
     if len(unique_vals) <= 5 or is_likert:
-        if is_likert:
+        if is_likert and likert_max > 0:
+            target_k = likert_max
+            groups = [[float(v)] for v in range(1, likert_max + 1)]
+        elif is_likert:
             target_k = len(unique_vals)
+            counts = valid_data.value_counts(normalize=True).sort_index()
+            groups = [[val] for val in counts.index]
         else:
             target_k = min(len(unique_vals), 3) # 고유값이 3개 이하면 그 수만큼, 4~5개면 3개로 범주화
-        
-        counts = valid_data.value_counts(normalize=True).sort_index()
-        groups = [[val] for val in counts.index]
+            counts = valid_data.value_counts(normalize=True).sort_index()
+            groups = [[val] for val in counts.index]
         
         while len(groups) > target_k:
             group_freqs = [sum(counts[v] for v in g) for g in groups]
@@ -331,9 +386,18 @@ def suggest_bins(series, continuous, k=3, label=None, var_type_val=None):
                 rule['opR'] = '이하'
                     
             parts = []
-            if rule['opL'] != '선택안함': parts.append(f"{rule['valL']} {rule['opL']}")
-            if rule['opR'] != '선택안함': parts.append(f"{rule['valR']} {rule['opR']}")
-            v_labels[i+1] = " ".join(parts) if parts else "전체"
+            if min_v == max_v:
+                cv = int(min_v)
+                if predefined_labels is not None and cv in predefined_labels:
+                    v_labels[i+1] = predefined_labels[cv]
+                elif is_likert:
+                    v_labels[i+1] = f"{cv}점"
+                else:
+                    v_labels[i+1] = f"{cv}"
+            else:
+                if rule['opL'] != '선택안함': parts.append(f"{rule['valL']} {rule['opL']}")
+                if rule['opR'] != '선택안함': parts.append(f"{rule['valR']} {rule['opR']}")
+                v_labels[i+1] = " ".join(parts) if parts else "전체"
             bins.append(rule)
             
         return {
@@ -778,6 +842,10 @@ def main():
                 sheet_name = st.selectbox("메타데이터 시트", xl.sheet_names)
                 df_meta = pd.read_excel(meta_file, sheet_name=sheet_name)
                 
+                if 'column_guide_labels' not in st.session_state or st.session_state.get('_last_meta_file') != meta_file.name:
+                    st.session_state.column_guide_labels = parse_column_guide_labels(xl)
+                    st.session_state._last_meta_file = meta_file.name
+                
                 def col_to_idx(c): return ord(c.upper()) - ord('A')
                 mapping = {
                     'var': col_to_idx(var_col),
@@ -1032,6 +1100,7 @@ def main():
                                     xl_cat = pd.ExcelFile(cat_meta_file)
                                     cat_sheet = st.selectbox("메타데이터 시트 (새 업로드)", xl_cat.sheet_names, key="cat_meta_sheet")
                                     cat_meta_override = pd.read_excel(cat_meta_file, sheet_name=cat_sheet)
+                                    st.session_state.cat_tab_guide_labels = parse_column_guide_labels(xl_cat)
                                     st.success("메타데이터 로드 완료")
                                 except Exception as e:
                                     st.error(f"새 메타데이터 로드 실패: {e}")
@@ -1253,8 +1322,13 @@ def main():
                                     
                                     # Load or Initialize Rule
                                     if v_name not in st.session_state.rules:
+                                        guide_labels_dict = st.session_state.get('cat_tab_guide_labels')
+                                        if guide_labels_dict is None:
+                                            guide_labels_dict = st.session_state.get('column_guide_labels', {})
+                                        predefined = guide_labels_dict.get(v_name)
+
                                         # Default to 3 bins, pass row context to suggest_bins for type detection
-                                        rule = suggest_bins(series, is_cont, k=3, label=v_label, var_type_val=str(row['type2']))
+                                        rule = suggest_bins(series, is_cont, k=3, label=v_label, var_type_val=str(row['type2']), predefined_labels=predefined)
                                         if rule:
                                             rule.update({'var':v_name, 'new_var':f"{v_name}_C", 'label':v_label, 'missing_policy':'keep', 'missing_code':9})
                                             st.session_state.rules[v_name] = rule
